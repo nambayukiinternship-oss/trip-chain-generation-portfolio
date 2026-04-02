@@ -1,16 +1,3 @@
-"""
-Created on Fri Jan 16 21:35:35 2026
-
-@author: 難波祐樹
-"""
-
-# -*- coding: utf-8 -*-
-"""
-Robust Diffusion Model with Post-Processing Smoothing
-- KL版 / MSE版 をそれぞれ学習(orロード)して 2000人分生成
-- 出力は KL/MSE でフォルダ分け
-"""
-
 import os
 import math
 import numpy as np
