@@ -17,8 +17,8 @@ EPOCHS = 30
 LR = 2e-4
 DIFF_STEPS = 1000
 
-TARGET_NUM = 2000      # ★各モデルで生成する人数
-GEN_BATCH = 500        # 生成時のバッチ（GPU/CPUに合わせて調整）
+TARGET_NUM = 2000      
+GEN_BATCH = 500        
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("DEVICE =", DEVICE)
@@ -262,7 +262,7 @@ def run_one(tag, x_path, m_path, dict_path, out_dir):
 # Main
 # =========================
 def main():
-    # 入力（あなたが作った保存先に合わせて）
+    # 入力
     configs = [
         {
             "tag": "KL",
