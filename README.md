@@ -150,14 +150,9 @@ trip-chain-generation-portfolio/
 ├── requirements.txt
 ├── data/
 │   ├── sample/        # サンプルデータ
-│   └── processed/     # 前処理済みデータ
 ├── src/
-│   ├── preprocessing/ # 前処理コード
 │   ├── autoencoder/   # AEモデル
 │   ├── diffusion/     # Diffusionモデル
 │   └── evaluation/    # 評価
-├── models/            # 学習済みモデル
 ├── results/
 │   ├── figures/       # 図
-│   └── generated_trips/ # 生成結果
-└── notebooks/         # 分析用Notebook
