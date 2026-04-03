@@ -10,9 +10,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 
-# ==========================================
+
 # 1. 実行設定・パス構成
-# ==========================================
+
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # ポートフォリオ用の相対パス設計
@@ -166,9 +166,9 @@ def grad_balance_total(losses_dict, params_for_balance, eps=1e-8, clamp=(0.2, 5.
 
     return total, scaled_terms, grad_norms
 
-# ==========================================
+
 # 5. 学習ループ
-# ==========================================
+
 def run_epoch(model, loader, optimizer, loss_fn, slices, params_for_balance=None, train=True):
     model.train() if train else model.eval()
     sum_losses, sum_scales, sum_gnorms = {}, {}, {}
