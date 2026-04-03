@@ -1,5 +1,6 @@
 import os
 import math
+import datetime
 import numpy as np
 import pandas as pd
 import torch
@@ -8,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 from scipy.spatial import distance
 
 # =========================
-# 共通設定
+# 1. 共通設定
 # =========================
 T_STEPS = 48
 D = 10
@@ -17,14 +18,13 @@ EPOCHS = 30
 LR = 2e-4
 DIFF_STEPS = 1000
 
-TARGET_NUM = 2000      
-GEN_BATCH = 500        
+TARGET_NUM = 2000      # 生成するエージェント数
+GEN_BATCH = 500        # 生成時のバッチサイズ
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("DEVICE =", DEVICE)
 
 # =========================
-# Dataset
+# 2. データセット定義
 # =========================
 class TripDataset(Dataset):
     def __init__(self, x_path, m_path):
@@ -38,7 +38,7 @@ class TripDataset(Dataset):
         return torch.from_numpy(self.X[idx]), torch.from_numpy(self.M[idx])
 
 # =========================
-# Model (Conv1d + Transformer)
+# 3. 拡散モデル構造 (Conv1d + Transformer)
 # =========================
 def sinusoidal_embedding(t, dim):
     half = dim // 2
@@ -57,32 +57,21 @@ class DiffusionTransformer(nn.Module):
         self.act = nn.SiLU()
         self.pos_emb = nn.Parameter(torch.zeros(1, T_STEPS, d_model))
         self.t_mlp = nn.Sequential(
-            nn.Linear(128, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, d_model)
+            nn.Linear(128, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
         )
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward=4 * d_model, batch_first=True
-        )
+        enc_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=4 * d_model, batch_first=True)
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers)
         self.out_proj = nn.Linear(d_model, d_in)
 
     def forward(self, x, t):
-        h = self.in_proj(x)
-        # Conv1d expects (B, C, T)
-        h = h.permute(0, 2, 1)
-        h = self.act(self.local_conv(h))
-        h = h.permute(0, 2, 1)
-
+        h = self.in_proj(x).permute(0, 2, 1)
+        h = self.act(self.local_conv(h)).permute(0, 2, 1)
         h = h + self.pos_emb
-        t_emb = sinusoidal_embedding(t, 128)
-        h = h + self.t_mlp(t_emb).unsqueeze(1)
-
-        h = self.encoder(h)
-        return self.out_proj(h)
+        h = h + self.t_mlp(sinusoidal_embedding(t, 128)).unsqueeze(1)
+        return self.out_proj(self.encoder(h))
 
 # =========================
-# DDPM & DDIM
+# 4. DDPM & DDIM サンプリング処理
 # =========================
 class DDPM:
     def __init__(self, n_steps=1000):
@@ -109,52 +98,41 @@ def sample_ddim(model, ddpm, n_samples, mean, std):
         alpha_bar = ddpm.alphas_bar[step]
         alpha_bar_prev = ddpm.alphas_bar[step - 1] if step > 0 else torch.tensor(1.0).to(DEVICE)
 
-        # x0 推定
         pred_x0 = (x - torch.sqrt(1 - alpha_bar) * eps) / torch.sqrt(alpha_bar)
-
-        # 次のx（ノイズ項なし）
         x = torch.sqrt(alpha_bar_prev) * pred_x0 + torch.sqrt(1 - alpha_bar_prev) * eps
 
     return (x * std + mean).cpu().numpy()
 
 # =========================
-# ベクトル平滑化
+# 5. ポストプロセス処理群
 # =========================
 def smooth_vectors(samples, window_size=5):
-    N, T, D_dim = samples.shape
+    """ベクトル平滑化によるノイズ除去"""
     smoothed = np.zeros_like(samples)
-    for i in range(N):
-        df_temp = pd.DataFrame(samples[i])
-        df_smooth = df_temp.rolling(window=window_size, center=True, min_periods=1).mean()
+    for i in range(samples.shape[0]):
+        df_smooth = pd.DataFrame(samples[i]).rolling(window=window_size, center=True, min_periods=1).mean()
         smoothed[i] = df_smooth.values
     return smoothed
 
-# =========================
-# デコード（最近傍）: バッチ処理
-# =========================
 def decode_to_mesh_codes(smooth_samples, dict_csv_path, decode_batch=2000):
+    """潜在空間のベクトルをメッシュコードに逆変換"""
     df_dict = pd.read_csv(dict_csv_path)
     dict_vecs = df_dict.filter(like="z").values
     dict_codes = df_dict["mesh4"].astype(str).values
 
     N_total, T, _ = smooth_samples.shape
     flat_samples = smooth_samples.reshape(N_total * T, D)
-
+    
     results = []
     for i in range(0, len(flat_samples), decode_batch):
         batch = flat_samples[i:i + decode_batch]
-        dists = distance.cdist(batch, dict_vecs)
-        idxs = np.argmin(dists, axis=1)
+        idxs = np.argmin(distance.cdist(batch, dict_vecs), axis=1)
         results.append(dict_codes[idxs])
 
-        if (i // decode_batch) % 10 == 0:
-            print(f"Decoding... {(i / len(flat_samples)) * 100:.1f}%")
-
-    final_codes = np.concatenate(results).reshape(N_total, T)
-    return final_codes
+    return np.concatenate(results).reshape(N_total, T)
 
 # =========================
-# 学習 or ロード
+# 6. 学習及びメインルーチン
 # =========================
 def train_or_load_model(model, ddpm, x_path, m_path, model_save_path, mean, std):
     if os.path.exists(model_save_path):
@@ -163,128 +141,88 @@ def train_or_load_model(model, ddpm, x_path, m_path, model_save_path, mean, std)
         return model
 
     print("Model not found. Starting Training...")
-    ds = TripDataset(x_path, m_path)
-    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
+    loader = DataLoader(TripDataset(x_path, m_path), batch_size=BATCH_SIZE, shuffle=True)
     opt = torch.optim.AdamW(model.parameters(), lr=LR)
 
     model.train()
     for epoch in range(EPOCHS):
         losses = []
         for x, m in loader:
-            x = x.to(DEVICE)
-            m = m.to(DEVICE)
-
+            x, m = x.to(DEVICE), m.to(DEVICE)
             x_norm = (x - mean) / std
 
             t = torch.randint(0, DIFF_STEPS, (x.shape[0],), device=DEVICE)
             noise = torch.randn_like(x_norm)
-            x_t = ddpm.q_sample(x_norm, t, noise)
-
-            pred_noise = model(x_t, t)
+            pred_noise = model(ddpm.q_sample(x_norm, t, noise), t)
 
             # Masked MSE (mask=1 only)
-            # 安全のため分母にeps
-            denom = m.sum() * D + 1e-8
-            loss = ((pred_noise - noise) ** 2 * m.unsqueeze(-1)).sum() / denom
+            loss = ((pred_noise - noise) ** 2 * m.unsqueeze(-1)).sum() / (m.sum() * D + 1e-8)
 
             opt.zero_grad()
             loss.backward()
             opt.step()
             losses.append(loss.item())
 
-        print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {float(np.mean(losses)):.4f}")
+        print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {np.mean(losses):.4f}")
 
     torch.save(model.state_dict(), model_save_path)
-    print(f"Model saved to {model_save_path}")
     return model
 
-# =========================
-# 1モデル分の一連処理
-# =========================
 def run_one(tag, x_path, m_path, dict_path, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     model_save_path = os.path.join(out_dir, f"best_model_{tag}.pth")
+    # 上書きを防ぐためのタイムスタンプ付き識別子
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    print("\n" + "=" * 60)
-    print(f"RUN: {tag}")
-    print("X_PATH   =", x_path)
-    print("M_PATH   =", m_path)
-    print("DICT_PATH=", dict_path)
-    print("OUT_DIR  =", out_dir)
+    print(f"\n{'='*60}\nRUN: {tag}")
+    
+    if not os.path.exists(x_path):
+        raise FileNotFoundError(f"Missing data file: {x_path}\n"
+                                "Please place the sample array data in the './data/input/' directory.")
 
-    # ---- 1) 統計量（mask=1の箇所のみ） ----
-    print("Loading Data & Calculating Stats...")
-    X_all = np.load(x_path).astype(np.float32)
-    M_all = np.load(m_path).astype(np.float32)
-
+    # マスク箇所のみ抽出した統計量計算
+    X_all, M_all = np.load(x_path).astype(np.float32), np.load(m_path).astype(np.float32)
     X_masked = X_all[M_all == 1]
     mean = torch.tensor(X_masked.mean(0), device=DEVICE)
     std = torch.tensor(X_masked.std(0) + 1e-8, device=DEVICE)
 
-    # ---- 2) モデル準備 ----
-    model = DiffusionTransformer().to(DEVICE)
-    ddpm = DDPM(DIFF_STEPS)
-    model = train_or_load_model(model, ddpm, x_path, m_path, model_save_path, mean, std)
+    model = train_or_load_model(DiffusionTransformer().to(DEVICE), DDPM(DIFF_STEPS), x_path, m_path, model_save_path, mean, std)
 
-    # ---- 3) 生成（2000人） ----
-    print(f"Generating {TARGET_NUM} samples (batch={GEN_BATCH})...")
+    print(f"Generating {TARGET_NUM} samples...")
     generated_list = []
     num_generated = 0
     while num_generated < TARGET_NUM:
-        current_batch = min(GEN_BATCH, TARGET_NUM - num_generated)
-        batch_samples = sample_ddim(model, ddpm, current_batch, mean, std)
+        batch_samples = sample_ddim(model, DDPM(DIFF_STEPS), min(GEN_BATCH, TARGET_NUM - num_generated), mean, std)
         generated_list.append(batch_samples)
-        num_generated += current_batch
-        print(f"Progress: {num_generated} / {TARGET_NUM}")
+        num_generated += len(batch_samples)
 
-    raw_samples = np.concatenate(generated_list, axis=0)  # (N,48,10)
-    print("Generation Complete. Shape:", raw_samples.shape)
-
-    # ---- 4) 平滑化 ----
-    print("Applying Vector Smoothing (Window=5)...")
+    raw_samples = np.concatenate(generated_list, axis=0)
     smooth_samples = smooth_vectors(raw_samples, window_size=5)
+    final_codes = decode_to_mesh_codes(smooth_samples, dict_path)
 
-    # ---- 5) デコード ----
-    print("Decoding to Mesh Codes...")
-    final_codes = decode_to_mesh_codes(smooth_samples, dict_path, decode_batch=2000)
+    # 保存処理
+    csv_path = os.path.join(out_dir, f"final_trips_{tag}_{TARGET_NUM}_{timestamp}.csv")
+    pd.DataFrame(final_codes).to_csv(csv_path, index=False)
+    np.save(os.path.join(out_dir, f"generated_raw_{tag}_{TARGET_NUM}_{timestamp}.npy"), raw_samples.astype(np.float32))
+    np.save(os.path.join(out_dir, f"generated_smooth_{tag}_{TARGET_NUM}_{timestamp}.npy"), smooth_samples.astype(np.float32))
 
-    # 保存（CSV）
-    save_path = os.path.join(out_dir, f"final_trips_{tag}_{TARGET_NUM}.csv")
-    pd.DataFrame(final_codes).to_csv(save_path, index=False)
-    print(f"Saved {TARGET_NUM} trips to {save_path}")
+    print(f"Process complete. Results saved to {out_dir}")
 
-    # 生成テンソルも保存（必要なら）
-    np.save(os.path.join(out_dir, f"generated_raw_{tag}_{TARGET_NUM}.npy"), raw_samples.astype(np.float32))
-    np.save(os.path.join(out_dir, f"generated_smooth_{tag}_{TARGET_NUM}.npy"), smooth_samples.astype(np.float32))
-    print("Saved generated npy (raw & smooth).")
-
-# =========================
-# Main
-# =========================
 def main():
-    # 入力
+    print(f"DEVICE = {DEVICE}")
+    # ポートフォリオ用の相対パス設計
     configs = [
         {
-            "tag": "KL",
-            "x_path": r"trip_outputs\trip_outputs_KL\X_trip_48x10.npy",
-            "m_path": r"trip_outputs\trip_outputs_KL\mask_48.npy",
-            "dict_path": r"C:/anaconda/Lib/site-packages/pandas/io/formats/mesh4_to_z10_KL.csv",
-            "out_dir": r"diffusion_final_KL",
-        },
-        {
             "tag": "MSE",
-            "x_path": r"trip_outputs\trip_outputs_MSE\X_trip_48x10.npy",
-            "m_path": r"trip_outputs\trip_outputs_MSE\mask_48.npy",
-            "dict_path": r"C:/anaconda/Lib/site-packages/pandas/io/formats/mesh4_to_z10_MSE.csv",
-            "out_dir": r"diffusion_final_MSE",
+            "x_path": r"./data/input/X_trip_48x10.npy",
+            "m_path": r"./data/input/mask_48.npy",
+            "dict_path": r"./data/dictionary/mesh4_to_z10_MSE.csv",
+            "out_dir": r"./outputs/diffusion",
         }
     ]
 
     for cfg in configs:
         run_one(**cfg)
 
-    print("\n=== ALL DONE ===")
-
 if __name__ == "__main__":
     main()
-
