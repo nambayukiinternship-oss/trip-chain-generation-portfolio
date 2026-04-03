@@ -8,9 +8,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from scipy.spatial import distance
 
-# =========================
 # 1. 共通設定
-# =========================
 T_STEPS = 48
 D = 10
 BATCH_SIZE = 256
@@ -23,9 +21,9 @@ GEN_BATCH = 500        # 生成時のバッチサイズ
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# =========================
+
 # 2. データセット定義
-# =========================
+
 class TripDataset(Dataset):
     def __init__(self, x_path, m_path):
         self.X = np.load(x_path).astype(np.float32)
@@ -37,9 +35,9 @@ class TripDataset(Dataset):
     def __getitem__(self, idx):
         return torch.from_numpy(self.X[idx]), torch.from_numpy(self.M[idx])
 
-# =========================
+
 # 3. 拡散モデル構造 (Conv1d + Transformer)
-# =========================
+
 def sinusoidal_embedding(t, dim):
     half = dim // 2
     freqs = torch.exp(-math.log(10000) * torch.arange(0, half, device=t.device).float() / half)
@@ -70,9 +68,9 @@ class DiffusionTransformer(nn.Module):
         h = h + self.t_mlp(sinusoidal_embedding(t, 128)).unsqueeze(1)
         return self.out_proj(self.encoder(h))
 
-# =========================
+
 # 4. DDPM & DDIM サンプリング処理
-# =========================
+
 class DDPM:
     def __init__(self, n_steps=1000):
         self.n_steps = n_steps
@@ -103,9 +101,9 @@ def sample_ddim(model, ddpm, n_samples, mean, std):
 
     return (x * std + mean).cpu().numpy()
 
-# =========================
+
 # 5. ポストプロセス処理群
-# =========================
+
 def smooth_vectors(samples, window_size=5):
     """ベクトル平滑化によるノイズ除去"""
     smoothed = np.zeros_like(samples)
@@ -131,9 +129,9 @@ def decode_to_mesh_codes(smooth_samples, dict_csv_path, decode_batch=2000):
 
     return np.concatenate(results).reshape(N_total, T)
 
-# =========================
+
 # 6. 学習及びメインルーチン
-# =========================
+
 def train_or_load_model(model, ddpm, x_path, m_path, model_save_path, mean, std):
     if os.path.exists(model_save_path):
         print(f"Loading existing model from {model_save_path}...")
