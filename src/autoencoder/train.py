@@ -1,267 +1,446 @@
+# ============================================================
+# 4次メッシュ × 時刻 の AutoEncoder
+# 入力：
+#   x_diff, y_diff
+#   population_at_time
+#   sin_time, cos_time
+#   産業・施設特徴量
+#
+# 出力：
+#   mesh_time_id ごとの10次元潜在ベクトル
+# ============================================================
+
 import os
-import datetime
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import joblib
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
 
 
-# 1. 実行設定・パス構成
+# ============================================================
+# 1. 設定
+# ============================================================
 
-timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+file_path = r"C:\卒論データ\processed_data_alphabet_split.csv"
 
-# ポートフォリオ用の相対パス設計
-INPUT_CSV_PATH = r"./data/input/processed_data_alphabet_split.csv"
-OUT_DIR = r"./outputs/autoencoder"
-os.makedirs(OUT_DIR, exist_ok=True)
+output_dir = r"C:\卒論データ\ae_mesh_time_embedding"
+os.makedirs(output_dir, exist_ok=True)
 
-PROCESSED_CSV_PATH = os.path.join(OUT_DIR, f"processed_data_ready_AE_MSE_{timestamp}.csv")
-MODEL_SAVE_PATH = os.path.join(OUT_DIR, f"ae_MSE_only_model_{timestamp}.pth")
-HISTORY_SAVE_PATH = os.path.join(OUT_DIR, f"loss_history_AE_MSE_only_{timestamp}.csv")
-DICT_SAVE_PATH = os.path.join(OUT_DIR, f"mesh4_to_z10_MSE_{timestamp}.csv")
+latent_dim = 10
+batch_size = 256
+epochs = 100
+learning_rate = 1e-3
+random_seed = 42
 
-BATCH_SIZE = 32
-EPOCHS = 100
-LEARNING_RATE = 1e-3
-VAL_SPLIT = 0.2
-LATENT_DIM = 10
-SEED = 42
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("使用デバイス:", device)
 
-USE_GRAD_BALANCE = False
-GRAD_BALANCE_CLAMP = (0.2, 5.0)
+np.random.seed(random_seed)
+torch.manual_seed(random_seed)
 
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ==========================================
-# 2. データ前処理
-# ==========================================
-def preprocess_data(input_path, output_path):
-    print(f"Loading data from: {input_path}")
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(f"Input file not found: {input_path}\n"
-                                "Please ensure the dummy/sample data is placed in the './data/input/' directory.")
+# ============================================================
+# 2. CSV読み込み
+# ============================================================
 
-    df = pd.read_csv(input_path)
+df = pd.read_csv(file_path)
 
-    id_cols = ['4mesh code']
-    coord_cols = ['x_diff', 'y_diff']
-    pop_cols = [str(x) for x in range(0, 2400, 100)]  # 0..2300 (24列)
-    poi_cols = [c for c in df.columns if c not in id_cols + coord_cols + pop_cols]
+print("元データ形状:", df.shape)
+print("列名:")
+print(df.columns.tolist())
 
-    df_log = df.copy()
 
-    # 数値化（欠損は0）
-    numeric_cols = pop_cols + poi_cols
-    df_log[numeric_cols] = df_log[numeric_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
+# ============================================================
+# 3. 時刻列を取得
+# ============================================================
 
-    # log1p 変換
-    df_log[pop_cols] = np.log1p(df_log[pop_cols])
-    df_log[poi_cols] = np.log1p(df_log[poi_cols])
+# 0, 100, 200, ..., 2300 の列を自動取得
+time_cols = []
 
-    # pop: 全体最大で割る
-    pop_max = df_log[pop_cols].max().max()
-    df_log[pop_cols] = df_log[pop_cols] / (pop_max if pop_max != 0 else 1.0)
+for col in df.columns:
+    col_str = str(col)
 
-    # poi: 列最大で割る
-    for col in poi_cols:
-        m = df_log[col].max()
-        df_log[col] = df_log[col] / (m if m != 0 else 1.0)
+    if col_str.isdigit():
+        v = int(col_str)
 
-    # coord: 座標系の最大値で割る
-    coord_max = max(df['x_diff'].max(), df['y_diff'].max())
-    df_log['x_diff'] = df['x_diff'] / (coord_max if coord_max != 0 else 1.0)
-    df_log['y_diff'] = df['y_diff'] / (coord_max if coord_max != 0 else 1.0)
+        if 0 <= v <= 2300:
+            time_cols.append(col)
 
-    df_log.to_csv(output_path, index=False)
-    print(f"Saved processed CSV: {output_path}")
-    return pop_cols, poi_cols, coord_cols
+time_cols = sorted(time_cols, key=lambda x: int(x))
 
-# ==========================================
-# 3. データセットとモデル定義 (AutoEncoder)
-# ==========================================
-class MeshDataset(Dataset):
-    def __init__(self, csv_file, pop_cols, poi_cols, coord_cols):
-        self.df = pd.read_csv(csv_file)
-        self.feature_cols = coord_cols + pop_cols + poi_cols
-        self.data = torch.tensor(self.df[self.feature_cols].values, dtype=torch.float32)
+print("時刻列:")
+print(time_cols)
 
-        self.slices = {
-            'coord': slice(0, len(coord_cols)),
-            'pop': slice(len(coord_cols), len(coord_cols) + len(pop_cols)),
-            'poi': slice(len(coord_cols) + len(pop_cols), None)
-        }
+
+# ============================================================
+# 4. 列の整理
+# ============================================================
+
+mesh_col = "4mesh code"
+coord_cols = ["x_diff", "y_diff"]
+
+# mesh_col, 時刻列, 座標列以外を産業・施設特徴量とする
+exclude_cols = [mesh_col] + time_cols + coord_cols
+
+poi_cols = [col for col in df.columns if col not in exclude_cols]
+
+print("産業・施設特徴量の列数:", len(poi_cols))
+print("産業・施設特徴量:")
+print(poi_cols)
+
+
+# ============================================================
+# 5. 横持ち人口データを縦持ちに変換
+# ============================================================
+
+long_df = df.melt(
+    id_vars=[mesh_col] + coord_cols + poi_cols,
+    value_vars=time_cols,
+    var_name="time",
+    value_name="population"
+)
+
+long_df["time"] = long_df["time"].astype(int)
+
+# mesh_time_id を作成
+# 例：483074102_0800
+long_df["mesh_time_id"] = (
+    long_df[mesh_col].astype(str)
+    + "_"
+    + long_df["time"].astype(str).str.zfill(4)
+)
+
+print("時刻展開後の形状:", long_df.shape)
+print(long_df.head())
+
+
+# ============================================================
+# 6. 時刻特徴量を作成
+# ============================================================
+
+# 0, 100, 200, ... を hour に変換
+long_df["hour"] = long_df["time"] // 100
+
+# sin_time, cos_time を作成
+# -1〜1 ではなく，0〜1に変換してAEに入れる
+long_df["sin_time"] = (
+    np.sin(2 * np.pi * long_df["hour"] / 24) + 1
+) / 2
+
+long_df["cos_time"] = (
+    np.cos(2 * np.pi * long_df["hour"] / 24) + 1
+) / 2
+
+
+# ============================================================
+# 7. 入力特徴量の前処理
+# ============================================================
+
+# 人口は偏りが大きいので log1p を使う
+long_df["population_log"] = np.log1p(long_df["population"])
+
+# 産業・施設特徴量にも log1p を使う
+for col in poi_cols:
+    long_df[col] = np.log1p(long_df[col])
+
+# AutoEncoderへの入力特徴量
+feature_cols = (
+    coord_cols
+    + ["population_log", "sin_time", "cos_time"]
+    + poi_cols
+)
+
+print("入力特徴量:")
+print(feature_cols)
+
+X_raw = long_df[feature_cols].values.astype(np.float32)
+
+print("入力データ shape:", X_raw.shape)
+
+
+# ============================================================
+# 8. 0〜1に正規化
+# ============================================================
+
+scaler = MinMaxScaler()
+X_scaled = scaler.fit_transform(X_raw).astype(np.float32)
+
+# scalerを保存
+scaler_path = os.path.join(output_dir, "scaler.pkl")
+joblib.dump(scaler, scaler_path)
+
+# 使用した特徴量列を保存
+feature_cols_path = os.path.join(output_dir, "feature_cols.txt")
+
+with open(feature_cols_path, "w", encoding="utf-8") as f:
+    for col in feature_cols:
+        f.write(str(col) + "\n")
+
+print("正規化後 shape:", X_scaled.shape)
+
+
+# ============================================================
+# 9. 学習データ・検証データに分割
+# ============================================================
+
+train_X, val_X = train_test_split(
+    X_scaled,
+    test_size=0.2,
+    random_state=random_seed,
+    shuffle=True
+)
+
+
+class MeshTimeDataset(Dataset):
+    def __init__(self, X):
+        self.X = torch.tensor(X, dtype=torch.float32)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.X)
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        return self.X[idx]
 
-class AE(nn.Module):
+
+train_dataset = MeshTimeDataset(train_X)
+val_dataset = MeshTimeDataset(val_X)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    shuffle=True
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=batch_size,
+    shuffle=False
+)
+
+
+# ============================================================
+# 10. AutoEncoder モデル定義
+# ============================================================
+
+class AutoEncoder(nn.Module):
     def __init__(self, input_dim, latent_dim=10):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, 128)
-        self.fc2 = nn.Linear(128, 64)
-        self.fc_z = nn.Linear(64, latent_dim)
 
-        self.fc3 = nn.Linear(latent_dim, 64)
-        self.fc4 = nn.Linear(64, 128)
-        self.fc5 = nn.Linear(128, input_dim)
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
 
-    def encode(self, x):
-        h = F.relu(self.fc1(x))
-        h = F.relu(self.fc2(h))
-        return self.fc_z(h)
+            nn.Linear(128, 64),
+            nn.ReLU(),
 
-    def decode(self, z):
-        h = F.relu(self.fc3(z))
-        h = F.relu(self.fc4(h))
-        return torch.sigmoid(self.fc5(h))
+            nn.Linear(64, latent_dim)
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+
+            nn.Linear(64, 128),
+            nn.ReLU(),
+
+            nn.Linear(128, input_dim),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        z = self.encode(x)
-        recon = self.decode(z)
-        return recon, z
+        z = self.encoder(x)
+        x_recon = self.decoder(z)
+        return x_recon, z
 
-# ==========================================
-# 4. 損失関数と勾配調整
-# ==========================================
-class Loss_MSE_only(nn.Module):
-    def forward(self, recon_x, x, slices):
-        return {
-            "Pop_MSE": F.mse_loss(recon_x[:, slices['pop']], x[:, slices['pop']]),
-            "POI_MSE": F.mse_loss(recon_x[:, slices['poi']], x[:, slices['poi']]),
-            "Coord_MSE": F.mse_loss(recon_x[:, slices['coord']], x[:, slices['coord']]),
-        }
 
-def grad_balance_total(losses_dict, params_for_balance, eps=1e-8, clamp=(0.2, 5.0)):
-    names = list(losses_dict.keys())
-    g_list = []
-    
-    for n in names:
-        grads = torch.autograd.grad(
-            losses_dict[n], params_for_balance,
-            retain_graph=True, create_graph=False, allow_unused=True
+input_dim = X_scaled.shape[1]
+
+model = AutoEncoder(
+    input_dim=input_dim,
+    latent_dim=latent_dim
+).to(device)
+
+criterion = nn.MSELoss()
+
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=learning_rate
+)
+
+print(model)
+
+
+# ============================================================
+# 11. 学習
+# ============================================================
+
+best_val_loss = float("inf")
+best_model_path = os.path.join(output_dir, "best_autoencoder.pth")
+
+history = []
+
+for epoch in range(1, epochs + 1):
+
+    # -----------------------------
+    # train
+    # -----------------------------
+    model.train()
+    train_loss = 0.0
+
+    for batch in train_loader:
+        batch = batch.to(device)
+
+        optimizer.zero_grad()
+
+        recon, z = model(batch)
+
+        loss = criterion(recon, batch)
+
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item() * batch.size(0)
+
+    train_loss /= len(train_loader.dataset)
+
+    # -----------------------------
+    # validation
+    # -----------------------------
+    model.eval()
+    val_loss = 0.0
+
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = batch.to(device)
+
+            recon, z = model(batch)
+
+            loss = criterion(recon, batch)
+
+            val_loss += loss.item() * batch.size(0)
+
+    val_loss /= len(val_loader.dataset)
+
+    history.append({
+        "epoch": epoch,
+        "train_loss": train_loss,
+        "val_loss": val_loss
+    })
+
+    # 最良モデルを保存
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), best_model_path)
+
+    if epoch == 1 or epoch % 10 == 0:
+        print(
+            f"Epoch [{epoch:03d}/{epochs}] "
+            f"Train Loss: {train_loss:.6f} "
+            f"Val Loss: {val_loss:.6f}"
         )
-        norm_sq = sum(torch.sum(g.detach() ** 2) for g in grads if g is not None)
-        g_list.append(torch.sqrt(norm_sq + eps))
-
-    g_stack = torch.stack(g_list)
-    g_bar = torch.mean(g_stack)
-    scales = (g_bar / (g_stack + eps)).clamp(clamp[0], clamp[1])
-
-    total = 0.0
-    scaled_terms, grad_norms = {}, {}
-    for i, n in enumerate(names):
-        total += scales[i] * losses_dict[n]
-        scaled_terms[n] = float(scales[i].item())
-        grad_norms[n] = float(g_stack[i].item())
-
-    return total, scaled_terms, grad_norms
 
 
-# 5. 学習ループ
+# 学習履歴を保存
+history_df = pd.DataFrame(history)
 
-def run_epoch(model, loader, optimizer, loss_fn, slices, params_for_balance=None, train=True):
-    model.train() if train else model.eval()
-    sum_losses, sum_scales, sum_gnorms = {}, {}, {}
-    sum_total = 0.0
+history_df.to_csv(
+    os.path.join(output_dir, "training_history.csv"),
+    index=False,
+    encoding="utf-8-sig"
+)
 
-    for batch in loader:
-        batch = batch.to(DEVICE)
-        if train:
-            optimizer.zero_grad()
+print("学習完了")
+print("Best Val Loss:", best_val_loss)
 
-        recon, _ = model(batch)
-        losses = loss_fn(recon, batch, slices)
 
-        if USE_GRAD_BALANCE:
-            total, scales, gnorms = grad_balance_total(
-                losses_dict=losses, params_for_balance=params_for_balance, clamp=GRAD_BALANCE_CLAMP
-            )
-        else:
-            total = sum(losses.values())
-            scales = {k: 1.0 for k in losses.keys()}
-            gnorms = {k: 0.0 for k in losses.keys()}
+# ============================================================
+# 12. Encoderで全データを10次元潜在ベクトルに変換
+# ============================================================
 
-        if train:
-            total.backward()
-            optimizer.step()
+model.load_state_dict(
+    torch.load(best_model_path, map_location=device)
+)
 
-        sum_total += float(total.item())
-        for k in losses.keys():
-            sum_losses[k] = sum_losses.get(k, 0.0) + float(losses[k].item())
-            sum_scales[k] = sum_scales.get(k, 0.0) + float(scales[k])
-            sum_gnorms[k] = sum_gnorms.get(k, 0.0) + float(gnorms[k])
+model.eval()
 
-    n = len(loader)
-    return (
-        sum_total / n,
-        {k: v / n for k, v in sum_losses.items()},
-        {k: v / n for k, v in sum_scales.items()},
-        {k: v / n for k, v in sum_gnorms.items()}
+X_tensor = torch.tensor(X_scaled, dtype=torch.float32).to(device)
+
+all_z = []
+
+with torch.no_grad():
+    for i in range(0, len(X_tensor), batch_size):
+        batch = X_tensor[i:i + batch_size]
+
+        z = model.encoder(batch)
+
+        all_z.append(z.cpu().numpy())
+
+all_z = np.vstack(all_z)
+
+print("潜在ベクトル shape:", all_z.shape)
+
+
+# ============================================================
+# 13. mesh_time_id ごとの潜在ベクトルを保存
+# ============================================================
+
+z_cols = [f"z{i + 1}" for i in range(latent_dim)]
+
+z_df = pd.DataFrame(all_z, columns=z_cols)
+
+output_df = pd.concat(
+    [
+        long_df[
+            [
+                "mesh_time_id",
+                mesh_col,
+                "time",
+                "hour"
+            ]
+        ].reset_index(drop=True),
+        z_df
+    ],
+    axis=1
+)
+
+output_path = os.path.join(output_dir, "mesh_time_to_z10.csv")
+
+output_df.to_csv(
+    output_path,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print("保存完了:")
+print(output_path)
+
+print(output_df.head())
+
+
+# ============================================================
+# 14. 時刻別にも保存
+# ============================================================
+
+time_split_dir = os.path.join(output_dir, "time_split_z10")
+os.makedirs(time_split_dir, exist_ok=True)
+
+for t, sub_df in output_df.groupby("time"):
+    save_path = os.path.join(
+        time_split_dir,
+        f"mesh_time_z10_{str(t).zfill(4)}.csv"
     )
 
-def main():
-    print(f"DEVICE = {DEVICE}")
-    pop_cols, poi_cols, coord_cols = preprocess_data(INPUT_CSV_PATH, PROCESSED_CSV_PATH)
+    sub_df.to_csv(
+        save_path,
+        index=False,
+        encoding="utf-8-sig"
+    )
 
-    full_dataset = MeshDataset(PROCESSED_CSV_PATH, pop_cols, poi_cols, coord_cols)
-    val_size = int(len(full_dataset) * VAL_SPLIT)
-    train_dataset, val_dataset = random_split(full_dataset, [len(full_dataset) - val_size, val_size])
-
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-    model = AE(input_dim=len(full_dataset.feature_cols), latent_dim=LATENT_DIM).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    loss_fn = Loss_MSE_only()
-    params_for_balance = [model.fc1.weight, model.fc1.bias, model.fc2.weight, model.fc2.bias]
-
-    loss_names = ["Pop_MSE", "POI_MSE", "Coord_MSE"]
-    history = {k: {"train": [], "val": []} for k in (loss_names + ["Total_Loss"])}
-
-    print("=== Training Started: AutoEncoder (MSE-only) ===")
-    for epoch in range(EPOCHS):
-        tr_total, tr_losses, _, _ = run_epoch(model, train_loader, optimizer, loss_fn, full_dataset.slices, params_for_balance, train=True)
-        va_total, va_losses, _, _ = run_epoch(model, val_loader, optimizer, loss_fn, full_dataset.slices, params_for_balance, train=False)
-
-        history["Total_Loss"]["train"].append(tr_total)
-        history["Total_Loss"]["val"].append(va_total)
-        for k in loss_names:
-            history[k]["train"].append(tr_losses.get(k, 0.0))
-            history[k]["val"].append(va_losses.get(k, 0.0))
-
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"[Epoch {epoch+1:3d}] train_total={tr_total:.6f} | val_total={va_total:.6f}")
-
-    # モデル・履歴の保存
-    torch.save(model.state_dict(), MODEL_SAVE_PATH)
-    
-    df_train = pd.DataFrame({k: history[k]["train"] for k in history.keys()}).add_prefix("train_")
-    df_val = pd.DataFrame({k: history[k]["val"] for k in history.keys()}).add_prefix("val_")
-    pd.concat([df_train, df_val], axis=1).to_csv(HISTORY_SAVE_PATH, index_label="epoch")
-
-    # 潜在変数の保存 (Z次元マッピング)
-    model.eval()
-    mesh4 = full_dataset.df["4mesh code"].astype(str).values
-    X_all = torch.tensor(full_dataset.df[full_dataset.feature_cols].values, dtype=torch.float32).to(DEVICE)
-    
-    with torch.no_grad():
-        z_all = model.encode(X_all).cpu().numpy()
-
-    latent_df = pd.DataFrame({"mesh4": mesh4})
-    for i in range(LATENT_DIM):
-        latent_df[f"z{i+1}"] = z_all[:, i]
-    latent_df.to_csv(DICT_SAVE_PATH, index=False)
-    print("=== Training Complete and Assets Saved ===")
-
-if __name__ == "__main__":
-    main()
+print("時刻別ファイルも保存しました:")
+print(time_split_dir)
